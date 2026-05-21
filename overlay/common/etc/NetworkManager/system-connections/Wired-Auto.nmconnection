@@ -1,0 +1,13 @@
+[connection]
+id=Wired Auto
+uuid=auto-wired
+type=ethernet
+autoconnect=true
+
+[ethernet]
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto

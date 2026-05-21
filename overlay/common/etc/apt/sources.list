@@ -1,0 +1,5 @@
+# Deepin 25 社区稳定源
+deb https://community-packages.deepin.com/beige/ crimson main commercial community
+
+# HWE 硬件支持源 (新 Mesa/GPU 驱动)
+deb https://community-packages.deepin.com/hwe-25/ unstable main community commercial

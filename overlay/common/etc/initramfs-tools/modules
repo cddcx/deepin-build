@@ -1,0 +1,9 @@
+# Rockchip 存储驱动（确保 initramfs 能识别 NVMe/eMMC/SD）
+rockchip_pcie
+phy_rockchip_pcie
+nvme
+mmc_block
+sdhci_of_arasan
+sdhci_pltfm
+sdhci
+rkwifi

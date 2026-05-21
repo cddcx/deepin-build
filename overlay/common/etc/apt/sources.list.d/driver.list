@@ -1,0 +1,2 @@
+# Driver 驱动源 (默认禁用，crimson 下可能不存在)
+# deb https://community-packages.deepin.com/driver/ crimson main non-free

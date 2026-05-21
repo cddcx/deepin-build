@@ -1,0 +1,13 @@
+[Unit]
+Description=Expand root filesystem on first boot
+After=systemd-remount-fs.service
+Before=systemd-user-sessions.service
+ConditionPathExists=!/var/lib/.expanded
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/expand-rootfs.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
