@@ -1,5 +1,2 @@
-# /etc/fstab: static file system information.
-#
-# <file system>                           <mount point>  <type>  <options>          <dump>  <pass>
-UUID=PLACEHOLDER_UUID                     /              ext4    defaults,noatime   0       1
-/dev/mmcblk0p1                            /              ext4    defaults,noatime   0       1
+# 通用 fstab，实际 UUID 由构建脚本覆盖
+# <file system>    <mount point>  <type>  <options>       <dump>  <fsck>

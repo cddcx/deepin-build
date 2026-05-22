@@ -1,8 +1,8 @@
 #!/bin/sh
-# initramfs 预挂载脚本: 加载 Rockchip PCIe/NVMe 驱动
+# 确保 NVMe 在 initramfs 中可用
 PREREQ=""
 prereqs() {
-    echo "${PREREQ}"
+    echo "$PREREQ"
 }
 case $1 in
     prereqs)
@@ -11,21 +11,5 @@ case $1 in
         ;;
 esac
 
-. /scripts/functions
-
-log_begin_msg "Loading Rockchip storage drivers"
-
-# 加载 Rockchip PCIe 和存储驱动
-modprobe rockchip_pcie 2>/dev/null || true
-modprobe phy_rockchip_pcie 2>/dev/null || true
+# 加载 NVMe 驱动
 modprobe nvme 2>/dev/null || true
-modprobe nvme_core 2>/dev/null || true
-modprobe mmc_block 2>/dev/null || true
-modprobe sdhci_of_arasan 2>/dev/null || true
-modprobe sdhci 2>/dev/null || true
-modprobe dw_mmc_rockchip 2>/dev/null || true
-
-# 等待设备就绪
-sleep 1
-
-log_end_msg
