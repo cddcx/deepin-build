@@ -6,8 +6,10 @@ ConditionPathExists=!/var/lib/.expanded
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/expand-rootfs.sh
+ExecStart=/usr/local/bin/expand-rootfs.sh
 RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

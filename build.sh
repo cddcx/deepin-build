@@ -1,19 +1,19 @@
 #!/bin/bash
 # ============================================================================
-# Deepin 25 Rockchip 通用多板卡镜像构建系统 (完整修复版)
-# 整合所有修复:
-#   - DDR固件自动搜索 (set -e安全)
-#   - U-Boot defconfig回退
-#   - 内核 rockchip_linux_defconfig 检测
-#   - 固件包容错 (mmdebstrap最小包集)
-#   - tar备份排除虚拟文件系统
-#   - 内核deb重复清理
-#   - UUID一致性 (/dev/mmcblkXp1)
-#   - dtb自动复制到 /boot/dtb/rockchip/
-#   - initramfs存储驱动
-#   - 智能rootfs管理 (同板卡复用/跨板卡备份)
-#   - GPU/HDMI配置
-#   - pipefail兼容性
+# Deepin 25 Rockchip 通用多板卡镜像构建系统 v2.0
+# 整合参考:
+#   - https://github.com/xiaobao1980/deepin-build
+#   - https://github.com/YukariChiba/deepin-ports-image
+#   - https://github.com/deepin-community/deepin-ports-kernel
+#   - https://github.com/xiaobao1980/armbian-build (board/family 配置)
+#   - https://www.deepin.org/zh/deepin25-orangepi/
+#
+# 特性:
+#   - 多板卡支持: rock-5-itx, cm3588-nas, orange-pi-5-plus, quartzpro64...
+#   - 多介质启动: SD / NVMe / eMMC (U-Boot 启动顺序 + extlinux 菜单)
+#   - 调用 armbian-build 内核/uboot 配置作为参考源
+#   - 智能 rootfs 管理: 同板卡复用 / 跨板卡备份 / 全新构建
+#   - 二次打包: 无需重新编译根文件系统
 # ============================================================================
 
 set -euo pipefail
@@ -28,7 +28,7 @@ DEVICE_CONFIG_DIR="${SCRIPT_DIR}/devices"
 DIST_NAME="deepin"
 DIST_VERSION="crimson"
 ARCH="arm64"
-IMAGE_SIZE_MB="6144"
+IMAGE_SIZE_MB="8192"
 
 LOG_FILE="${OUTPUT}/build-$(date +%Y%m%d-%H%M%S).log"
 mkdir -p "${WORKSPACE}" "${OUTPUT}" "${CACHE}"
@@ -39,10 +39,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log_info()  { echo -e "${GREEN}[INFO]${NC}  $1" | tee -a "${LOG_FILE}"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1" | tee -a "${LOG_FILE}"; }
+log_info() { echo -e "${GREEN}[INFO]${NC}  $1" | tee -a "${LOG_FILE}"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC}  $1" | tee -a "${LOG_FILE}"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1" | tee -a "${LOG_FILE}"; }
-log_step()  { echo -e "${BLUE}[STEP]${NC}  $1" | tee -a "${LOG_FILE}"; }
+log_step() { echo -e "${BLUE}[STEP]${NC}  $1" | tee -a "${LOG_FILE}"; }
 
 cleanup() {
     log_warn "执行清理..."
@@ -68,14 +68,30 @@ trap cleanup EXIT INT TERM
 
 check_prerequisites() {
     log_step "检查构建依赖..."
-    local deps=(mmdebstrap qemu-aarch64-static systemd-nspawn parted kpartx mkfs.ext4 mkfs.fat losetup fallocate gpg curl git rsync)
+    # 可执行命令检测
+    local deps=(mmdebstrap qemu-aarch64-static systemd-nspawn parted kpartx mkfs.ext4 mkfs.fat losetup fallocate gpg curl git rsync bc)
     local missing=()
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" &>/dev/null; then missing+=("$dep"); fi
     done
+    # 库包/头文件检测（不是可执行命令）
+    if ! python3 -c "import setuptools" &>/dev/null; then
+        missing+=("python3-setuptools")
+    fi
+    if [[ ! -f "/usr/include/python3.12/Python.h" ]] && [[ ! -f "/usr/include/python3.11/Python.h" ]] && [[ ! -f "/usr/include/python3.10/Python.h" ]]; then
+        missing+=("python3-dev")
+    fi
+    if [[ ! -f "/usr/include/gnutls/gnutls.h" ]]; then
+        missing+=("libgnutls28-dev")
+    fi
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "缺少依赖: ${missing[*]}"
-        log_info "sudo apt install -y mmdebstrap qemu-user-static systemd-container binfmt-support parted kpartx dosfstools e2fsprogs rsync git curl gpg"
+        log_info "安装命令:"
+        log_info "  sudo apt install -y mmdebstrap qemu-user-static systemd-container binfmt-support \\"
+        log_info "    parted kpartx dosfstools e2fsprogs rsync git curl gpg \\"
+        log_info "    build-essential crossbuild-essential-arm64 libncurses-dev \\"
+        log_info "    swig flex bison u-boot-tools bc libssh-dev kmod cpio \\"
+        log_info "    libelf-dev libssl-dev dwarves python3-pyelftools"
         exit 1
     fi
     if [[ ! -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]]; then
@@ -93,27 +109,44 @@ check_prerequisites() {
         exit 1
     fi
     if [[ ! -f "${DEVICE_CONFIG_DIR}/${BOARD}/device.conf" ]]; then
-        log_error "板卡 ${BOARD} 配置不存在"
+        log_error "板卡 ${BOARD} 配置不存在: ${DEVICE_CONFIG_DIR}/${BOARD}/device.conf"
         exit 1
     fi
+    log_info "目标板卡: ${BOARD}"
     log_info "所有依赖检查通过"
 }
 
 load_device_config() {
     log_step "加载板卡配置: ${BOARD}"
     source "${DEVICE_CONFIG_DIR}/${BOARD}/device.conf"
+
+    # 默认值
     UBOOT_DEFCONFIG="${UBOOT_DEFCONFIG:-${BOARD}_defconfig}"
     KERNEL_DTB="${KERNEL_DTB:-${BOARD}.dtb}"
     KERNEL_OVERLAYS="${KERNEL_OVERLAYS:-}"
     DDR_BIN="${DDR_BIN:-}"
+
+    # 从 armbian-build 参考配置读取（如果存在）
+    local armbian_board_conf="${SCRIPT_DIR}/armbian-board-ref/${BOARD}.conf"
+    if [[ -f "${armbian_board_conf}" ]]; then
+        log_info "发现 Armbian 参考配置，提取关键参数..."
+        # 提取 BOOTCONFIG, BOOT_FDT_FILE, KERNEL_TARGET 等作为参考
+        grep -E "^(BOOTCONFIG|BOOT_FDT_FILE|KERNEL_TARGET|SERIALCON|DEFAULT_OVERLAYS)=" "${armbian_board_conf}" 2>/dev/null | while read line; do
+            log_info "  Armbian ref: ${line}"
+        done || true
+    fi
+
     log_info "U-Boot defconfig: ${UBOOT_DEFCONFIG}"
     log_info "Kernel DTB: ${KERNEL_DTB}"
+    log_info "Kernel Overlays: ${KERNEL_OVERLAYS:-无}"
+    log_info "SOC: ${BOARD_SOC:-rk3588}"
 }
 
 prepare_sources() {
     log_step "准备源码和固件..."
     mkdir -p "${CACHE}"
 
+    # rkbin - Rockchip 官方固件二进制
     if [[ ! -d "${CACHE}/rkbin" ]]; then
         log_info "下载 rkbin..."
         git clone --depth=1 https://github.com/armbian/rkbin "${CACHE}/rkbin"
@@ -122,6 +155,7 @@ prepare_sources() {
         (cd "${CACHE}/rkbin" && git pull --ff-only) || true
     fi
 
+    # U-Boot - 优先使用板卡指定的源，否则主线
     if [[ ! -d "${CACHE}/u-boot" ]]; then
         log_info "下载 U-Boot..."
         local uboot_repo="${UBOOT_REPO:-https://github.com/u-boot/u-boot}"
@@ -133,17 +167,37 @@ prepare_sources() {
         fi
     fi
 
+    # TF-A (BL31)
     if [[ ! -d "${CACHE}/trusted-firmware-a" ]]; then
         log_info "下载 TF-A..."
         git clone --depth=1 -b v2.13.0 https://github.com/TrustedFirmware-A/trusted-firmware-a "${CACHE}/trusted-firmware-a"
     fi
 
+    # 内核 - 优先使用板卡指定的源
+    local kernel_repo="${KERNEL_REPO:-https://github.com/armbian/linux-rockchip}"
+    local kernel_branch="${KERNEL_BRANCH:-rk-6.1-rkr5.1}"
+
     if [[ ! -f "${CACHE}/linux-rockchip/Makefile" ]]; then
-        log_info "下载内核源码..."
+        log_info "下载内核源码 (${kernel_branch})..."
         rm -rf "${CACHE}/linux-rockchip"
-        local kernel_repo="${KERNEL_REPO:-https://github.com/armbian/linux-rockchip}"
-        local kernel_branch="${KERNEL_BRANCH:-rk-6.1-rkr5.1}"
         git clone --depth=1 -b "${kernel_branch}" "${kernel_repo}" "${CACHE}/linux-rockchip"
+    fi
+
+    # 下载 Armbian board/family 参考配置（用于提取启动顺序、补丁等）
+    if [[ ! -d "${SCRIPT_DIR}/armbian-board-ref" ]]; then
+        log_info "下载 Armbian 参考配置..."
+        mkdir -p "${SCRIPT_DIR}/armbian-board-ref"
+        # 仅下载关键配置文件
+        local armbian_raw="https://raw.githubusercontent.com/xiaobao1980/armbian-build/main"
+        for f in "config/boards/${BOARD}.conf" "config/sources/families/${BOARD_FAMILY:-rockchip-rk3588}.conf" "config/sources/families/include/rockchip64_common.inc"; do
+            curl -sL "${armbian_raw}/${f}" -o "${SCRIPT_DIR}/armbian-board-ref/$(basename ${f})" 2>/dev/null || true
+        done
+    fi
+
+    # 下载 GPU 固件
+    if [[ ! -f "${SCRIPT_DIR}/overlay/common/usr/lib/firmware/arm/mali/mali_csffw.bin" ]]; then
+        log_info "下载 GPU 固件..."
+        "${SCRIPT_DIR}/scripts/download-gpu-firmware.sh" 2>/dev/null || true
     fi
 
     log_info "源码准备完成"
@@ -156,16 +210,23 @@ build_tfa() {
     ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make PLAT=rk3588 bl31 -j$(nproc)
     export BL31="${PWD}/build/rk3588/release/bl31/bl31.elf"
     if [[ ! -f "${BL31}" ]]; then log_error "TF-A 编译失败"; exit 1; fi
-    log_info "TF-A 编译完成"
+    log_info "TF-A 编译完成: ${BL31}"
     popd
 }
 
 build_uboot() {
     log_step "编译 U-Boot..."
+
+    # 确保 python3-setuptools 已安装（U-Boot 的 pylibfdt 需要）
+    if ! python3 -c "import setuptools" 2>/dev/null; then
+        log_warn "缺少 python3-setuptools，正在安装..."
+        apt-get install -y python3-setuptools 2>/dev/null ||             apt-get install -y python3-distutils 2>/dev/null || true
+    fi
+
     pushd "${CACHE}/u-boot"
     make clean || true
 
-    # DDR固件自动搜索
+    # DDR 固件自动搜索
     local ddr_file=""
     local search_paths=("${CACHE}/rkbin/rk35" "${CACHE}/rkbin/bin/rk35" "${CACHE}/rkbin")
     for sp in "${search_paths[@]}"; do
@@ -190,26 +251,50 @@ build_uboot() {
 
     export BL31="${CACHE}/trusted-firmware-a/build/rk3588/release/bl31/bl31.elf"
 
+    # defconfig 回退策略
     local defconfig="${UBOOT_DEFCONFIG}"
     if [[ ! -f "configs/${defconfig}" ]]; then
-        for fb in rock5-rk3588_defconfig rock-5-itx-rk3588_defconfig rock5b-rk3588_defconfig; do
-            if [[ -f "configs/${fb}" ]]; then defconfig="${fb}"; log_warn "使用回退 defconfig: ${defconfig}"; break; fi
+        log_warn "defconfig ${defconfig} 不存在，尝试回退..."
+        local fallback_defs=("rock-5-itx-rk3588_defconfig" "rock5-rk3588_defconfig" "rock5b-rk3588_defconfig" "rock-5a-rk3588_defconfig")
+        for fb in "${fallback_defs[@]}"; do
+            if [[ -f "configs/${fb}" ]]; then 
+                defconfig="${fb}"; 
+                log_warn "使用回退 defconfig: ${defconfig}"; 
+                break; 
+            fi
         done
     fi
-    if [[ ! -f "configs/${defconfig}" ]]; then log_error "找不到 U-Boot defconfig"; exit 1; fi
+    if [[ ! -f "configs/${defconfig}" ]]; then 
+        log_error "找不到任何可用的 U-Boot defconfig"; 
+        exit 1; 
+    fi
+
+    # 应用 Armbian 参考的启动顺序补丁（如果存在）
+    if [[ -f "${SCRIPT_DIR}/armbian-board-ref/${BOARD}.conf" ]]; then
+        local boot_order_patch=$(grep -A20 "rockchip_uboot_targets" "${SCRIPT_DIR}/armbian-board-ref/${BOARD}.conf" 2>/dev/null | head -1)
+        if [[ -n "${boot_order_patch}" ]]; then
+            log_info "检测到 Armbian 启动顺序配置，应用补丁..."
+            # SD -> mmc1, NVMe -> nvme, eMMC -> mmc0
+            sed -i 's/#define BOOT_TARGETS.*/#define BOOT_TARGETS "mmc1 nvme mmc0 scsi usb pxe dhcp spi"/' include/configs/rockchip-common.h 2>/dev/null || true
+        fi
+    fi
 
     ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make "${defconfig}"
     ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j$(nproc)
 
-    if [[ -f "u-boot-rockchip.bin" ]]; then export UBOOT_BIN="${PWD}/u-boot-rockchip.bin"
-    elif [[ -f "u-boot.itb" ]]; then export UBOOT_BIN="${PWD}/u-boot.itb"
-    else log_error "U-Boot 编译输出未找到"; exit 1
+    if [[ -f "u-boot-rockchip.bin" ]]; then 
+        export UBOOT_BIN="${PWD}/u-boot-rockchip.bin"
+    elif [[ -f "u-boot.itb" ]]; then 
+        export UBOOT_BIN="${PWD}/u-boot.itb"
+    else 
+        log_error "U-Boot 编译输出未找到"; exit 1
     fi
-    log_info "U-Boot 编译完成"
+    log_info "U-Boot 编译完成: ${UBOOT_BIN}"
     popd
 }
 
 build_kernel() {
+    # 检查缓存的内核 deb
     if [[ -d "${CACHE}/kernel-debs" ]]; then
         local deb_count
         deb_count=$(ls -1 "${CACHE}/kernel-debs"/*.deb 2>/dev/null | wc -l)
@@ -224,17 +309,25 @@ build_kernel() {
     if [[ ! -f "${CACHE}/linux-rockchip/Makefile" ]]; then
         log_warn "内核源码缺失，重新下载..."
         rm -rf "${CACHE}/linux-rockchip"
-        git clone --depth=1 -b "${KERNEL_BRANCH:-rk-6.1-rkr5.1}" "${KERNEL_REPO:-https://github.com/armbian/linux-rockchip}" "${CACHE}/linux-rockchip"
+        local kernel_repo="${KERNEL_REPO:-https://github.com/armbian/linux-rockchip}"
+        local kernel_branch="${KERNEL_BRANCH:-rk-6.1-rkr5.1}"
+        git clone --depth=1 -b "${kernel_branch}" "${kernel_repo}" "${CACHE}/linux-rockchip"
     fi
     pushd "${CACHE}/linux-rockchip"
 
     make clean || true
-    local defconfigs=(rockchip_linux_defconfig rockchip_defconfig)
+
+    # defconfig 检测
+    local defconfigs=("rockchip_linux_defconfig" "rockchip_defconfig")
     local found=""
     for dc in "${defconfigs[@]}"; do
         if [[ -f "arch/arm64/configs/${dc}" ]]; then found="${dc}"; break; fi
     done
-    if [[ -z "${found}" ]]; then log_error "找不到内核 defconfig"; exit 1; fi
+    if [[ -z "${found}" ]]; then 
+        log_error "找不到内核 defconfig"; exit 1; 
+    fi
+    log_info "使用内核 defconfig: ${found}"
+
     ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make "${found}"
     ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make bindeb-pkg -j$(nproc)
 
@@ -276,18 +369,16 @@ build_rootfs() {
     local rootfs_dir="${WORKSPACE}/rootfs"
 
     # === 智能 rootfs 管理 ===
-    # 1. 已有完整 rootfs → 直接使用（同板卡增量构建）
-    # 2. 无 rootfs 但有备份 → 解压备份（跨板卡复用）
-    # 3. 都没有 → mmdebstrap 全新构建
-
     if [[ -z "${SKIP_ROOTFS:-}" ]]; then
+        # 1. 已有完整 rootfs → 直接使用（同板卡增量构建）
         if [[ -f "${rootfs_dir}/bin/bash" && -d "${rootfs_dir}/boot" ]]; then
             log_info "发现已有完整 rootfs，直接使用（同板卡增量构建）"
-            log_info "如需重新构建，设置 SKIP_ROOTFS=1 或删除 workspace/rootfs/"
+            log_info "如需重新构建: SKIP_ROOTFS=1 BOARD=${BOARD} ./build.sh"
             export CHROOT_EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
             return 0
         fi
 
+        # 2. 无 rootfs 但有备份 → 解压备份（跨板卡复用）
         local backup_files=()
         for f in "${WORKSPACE}"/rootfs-backup-*.tar.gz; do
             [[ -f "$f" ]] && backup_files+=("$f")
@@ -343,18 +434,20 @@ build_rootfs() {
 
     mkdir -p "${rootfs_dir}"
 
-    local base_packages="ca-certificates,locales,sudo,apt,adduser,polkitd,systemd,network-manager,dbus-daemon,apt-utils,bash-completion,curl,vim,bash,deepin-keyring,init,ssh,net-tools,iputils-ping,lshw,iproute2,iptables,procps,wpasupplicant,linux-firmware,fdisk,initramfs-tools,pciutils,usbutils"
+    # 最小基础包集（容错，不强制 firmware-realtek 等可能缺失的包）
+    local base_packages="ca-certificates,locales,sudo,apt,adduser,polkitd,systemd,network-manager,dbus-daemon,apt-utils,bash-completion,curl,vim,bash,deepin-keyring,init,ssh,net-tools,iputils-ping,lshw,iproute2,iptables,procps,wpasupplicant,fdisk,initramfs-tools,pciutils,usbutils"
     export CHROOT_EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
     local repos="deb https://community-packages.deepin.com/beige/ crimson main commercial community"
 
+    # 导入 Deepin GPG 密钥
     if [[ ! -f /usr/share/keyrings/deepin-archive-crimson-keyring.gpg ]]; then
         log_info "导入 Deepin GPG 密钥..."
         gpg --keyserver keyserver.ubuntu.com --recv-keys 425956BB3E31DF51 2>/dev/null || \
-        gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 425956BB3E31DF51 2>/dev/null || true
+            gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 425956BB3E31DF51 2>/dev/null || true
         gpg --export 425956BB3E31DF51 2>/dev/null | tee /usr/share/keyrings/deepin-archive-crimson-keyring.gpg >/dev/null || true
     fi
 
-    log_info "开始 mmdebstrap (这可能需要几分钟)..."
+    log_info "开始 mmdebstrap (这可能需要 10-30 分钟)..."
     mmdebstrap \
         --hook-dir=/usr/share/mmdebstrap/hooks/merged-usr \
         --skip=check/empty \
@@ -376,8 +469,8 @@ configure_rootfs() {
     log_step "配置根文件系统 (chroot)..."
     local rootfs_dir="${WORKSPACE}/rootfs"
 
-    mount --bind /dev  "${rootfs_dir}/dev"
-    mount -t proc  proc "${rootfs_dir}/proc"
+    mount --bind /dev "${rootfs_dir}/dev"
+    mount -t proc proc "${rootfs_dir}/proc"
     mount -t sysfs sysfs "${rootfs_dir}/sys"
     mount -t tmpfs -o "size=99%" tmpfs "${rootfs_dir}/tmp"
     cp /usr/bin/qemu-aarch64-static "${rootfs_dir}/usr/bin/" 2>/dev/null || true
@@ -400,8 +493,8 @@ ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 # 设置主机名
 echo "deepin-rockchip" > /etc/hostname
 cat > /etc/hosts <<'HOSTS'
-127.0.0.1   localhost
-127.0.1.1   deepin-rockchip
+127.0.0.1 localhost
+127.0.1.1 deepin-rockchip
 HOSTS
 
 # 配置网络
@@ -431,12 +524,6 @@ mkdir -p /etc/apt/sources.list.d
 cat > /etc/apt/sources.list.d/appstore.list <<'EOF'
 deb https://com-store-packages.uniontech.com/appstore-V25 crimson appstore
 EOF
-cat > /etc/apt/sources.list.d/driver.list <<'EOF'
-# deb https://community-packages.deepin.com/driver/ crimson main non-free
-EOF
-cat > /etc/apt/sources.list.d/proposed.list <<'EOF'
-# deb https://proposed-packages.deepin.com/beige-testing/ unstable/crimson main community commercial
-EOF
 
 # 更新 apt
 apt-get update 2>&1 | tee /tmp/apt-update.log || true
@@ -448,7 +535,7 @@ if grep -q "404" /tmp/apt-update.log 2>/dev/null; then
     apt-get update 2>/dev/null || true
 fi
 
-# 安装板卡额外包
+# 安装板卡额外包（容错，逐个安装）
 if [[ -n "${CHROOT_EXTRA_PACKAGES:-}" ]]; then
     echo "[chroot] 安装额外包: ${CHROOT_EXTRA_PACKAGES}"
     for pkg in ${CHROOT_EXTRA_PACKAGES//,/ }; do
@@ -456,12 +543,12 @@ if [[ -n "${CHROOT_EXTRA_PACKAGES:-}" ]]; then
     done
 fi
 
-# 安装可选包
+# 安装可选系统包
 for pkg in ntpsec-ntpdate fake-hwclock cloud-guest-utils dmidecode; do
     apt-get install -y "${pkg}" 2>/dev/null || echo "[WARN] ${pkg} 不可用，跳过"
 done
 
-# 安装桌面环境
+# 安装桌面环境（容错）
 apt-get install -y \
     deepin-desktop-environment-core \
     deepin-desktop-environment-base \
@@ -476,8 +563,8 @@ getent group video >/dev/null || groupadd -r video
 getent group render >/dev/null || groupadd -r render
 usermod -a -G video,render,audio,input deepin 2>/dev/null || true
 
-# 安装 Rockchip 多媒体
-for pkg in librockchip-mpp1 librockchip-vpu0 gstreamer1.0-rockchip1 rga2; do
+# 安装 Rockchip 多媒体包（容错）
+for pkg in librockchip-mpp1 librockchip-vpu0 gstreamer1.0-rockchip1 rga2 rockchip-mpp-drm; do
     apt-get install -y "${pkg}" 2>/dev/null || echo "[WARN] ${pkg} 不可用，跳过"
 done
 
@@ -486,8 +573,9 @@ if [[ -f /etc/systemd/system/expand-rootfs.service ]]; then
     systemctl enable expand-rootfs.service 2>/dev/null || true
 fi
 
-# 确保 initramfs 包含存储驱动
+# 确保 initramfs 包含存储驱动（SD/eMMC/NVMe）
 cat >> /etc/initramfs-tools/modules <<'INITMOD'
+# Rockchip 存储驱动
 rockchip_pcie
 phy_rockchip_pcie
 nvme
@@ -521,16 +609,17 @@ install_overlays() {
     local common_overlay="${SCRIPT_DIR}/overlay/common"
     local board_overlay="${DEVICE_CONFIG_DIR}/${BOARD}/overlay"
 
+    # 使用 rsync 代替 cp -a，-K 保持符号链接（避免 merged-usr 的 lib -> usr/lib 被覆盖）
     if [[ -d "${common_overlay}" ]]; then
         log_info "复制通用 overlay..."
-        cp -a "${common_overlay}/." "${rootfs_dir}/"
+        rsync -aK --ignore-errors "${common_overlay}/" "${rootfs_dir}/" 2>/dev/null ||             cp -a --parents "${common_overlay}/." "${rootfs_dir}/" 2>/dev/null || true
     fi
     if [[ -d "${board_overlay}" ]]; then
         log_info "复制板卡 overlay..."
-        cp -a "${board_overlay}/." "${rootfs_dir}/"
+        rsync -aK --ignore-errors "${board_overlay}/" "${rootfs_dir}/" 2>/dev/null ||             cp -a --parents "${board_overlay}/." "${rootfs_dir}/" 2>/dev/null || true
     fi
 
-    # 复制内核 deb 到 chroot（在 overlay 之后，configure 之前）
+    # 复制内核 deb 到 chroot
     if [[ -d "${KERNEL_DEB_DIR}" ]]; then
         local deb_count
         deb_count=$(ls -1 "${KERNEL_DEB_DIR}"/*.deb 2>/dev/null | wc -l)
@@ -542,6 +631,83 @@ install_overlays() {
     fi
 
     log_info "Overlay 安装完成"
+}
+
+install_kernel() {
+    log_step "安装内核到根文件系统..."
+    local rootfs_dir="${WORKSPACE}/rootfs"
+
+    if [[ ! -d "${KERNEL_DEB_DIR}" ]] || [[ $(ls -1 "${KERNEL_DEB_DIR}"/*.deb 2>/dev/null | wc -l) -eq 0 ]]; then
+        log_warn "没有缓存的内核 deb 包"
+        return 0
+    fi
+
+    mount --bind /dev "${rootfs_dir}/dev"
+    mount -t proc proc "${rootfs_dir}/proc"
+    mount -t sysfs sysfs "${rootfs_dir}/sys"
+    mount -t tmpfs -o "size=99%" tmpfs "${rootfs_dir}/tmp"
+    cp /usr/bin/qemu-aarch64-static "${rootfs_dir}/usr/bin/" 2>/dev/null || true
+
+    # 在 mount tmpfs 之后复制 deb 包到挂载点内（避免 tmpfs mount 覆盖）
+    mkdir -p "${rootfs_dir}/tmp/kernel-debs"
+    cp "${KERNEL_DEB_DIR}"/*.deb "${rootfs_dir}/tmp/kernel-debs/"
+    log_info "已复制 $(ls -1 "${rootfs_dir}/tmp/kernel-debs"/*.deb | wc -l) 个内核 deb 包到 chroot"
+
+    chroot "${rootfs_dir}" /bin/bash <<'CHROOT_EOF'
+set -e
+cd /tmp/kernel-debs
+# 安装内核包
+dpkg -i *.deb 2>/dev/null || apt-get install -f -y
+
+# 查找并复制 DTB 文件到 /boot/dtb/rockchip/
+mkdir -p /boot/dtb/rockchip/overlay
+
+# 查找 DTB 源目录（Armbian 内核 deb 通常安装在 /usr/lib/linux-image-*/ 或 /boot/dtb-*/）
+DTB_SRC=""
+for d in /usr/lib/linux-image-*/rockchip /boot/dtb-* /usr/lib/linux-image-*/; do
+    if [[ -d "${d}" ]] && [[ -n "$(ls "${d}"/*.dtb 2>/dev/null)" ]]; then
+        DTB_SRC="${d}"
+        break
+    fi
+done
+
+if [[ -n "${DTB_SRC}" ]]; then
+    echo "[INFO] 找到 DTB 源目录: ${DTB_SRC}"
+    cp -a "${DTB_SRC}"/*.dtb /boot/dtb/rockchip/ 2>/dev/null || true
+    # 复制 overlay
+    if [[ -d "${DTB_SRC}/overlay" ]]; then
+        cp -a "${DTB_SRC}/overlay"/*.dtbo /boot/dtb/rockchip/overlay/ 2>/dev/null || true
+    fi
+    # 如果源目录本身就是 rockchip 子目录，也检查上级目录
+    if [[ "${DTB_SRC}" == */rockchip ]]; then
+        parent=$(dirname "${DTB_SRC}")
+        if [[ -d "${parent}/overlay" ]]; then
+            cp -a "${parent}/overlay"/*.dtbo /boot/dtb/rockchip/overlay/ 2>/dev/null || true
+        fi
+    fi
+else
+    echo "[WARN] 未找到 DTB 源目录，尝试全局搜索..."
+    find /usr/lib/linux-image-* -name "*.dtb" -exec cp {} /boot/dtb/rockchip/ \; 2>/dev/null || true
+    find /usr/lib/linux-image-* -name "*.dtbo" -exec cp {} /boot/dtb/rockchip/overlay/ \; 2>/dev/null || true
+fi
+
+# 列出已复制的 DTB
+echo "[INFO] /boot/dtb/rockchip/ 内容:"
+ls -la /boot/dtb/rockchip/ 2>/dev/null || echo "[WARN] 目录为空"
+echo "[INFO] /boot/dtb/rockchip/overlay/ 内容:"
+ls -la /boot/dtb/rockchip/overlay/ 2>/dev/null || echo "[WARN] overlay 目录为空"
+
+# 清理
+rm -rf /tmp/kernel-debs
+apt-get clean
+CHROOT_EOF
+
+    umount -lf "${rootfs_dir}/tmp" 2>/dev/null || true
+    umount -lf "${rootfs_dir}/proc" 2>/dev/null || true
+    umount -lf "${rootfs_dir}/sys" 2>/dev/null || true
+    umount -lf "${rootfs_dir}/dev" 2>/dev/null || true
+
+    log_info "内核安装完成"
 }
 
 generate_extlinux() {
@@ -558,15 +724,16 @@ generate_extlinux() {
     local overlay_path="/boot/dtb/rockchip/overlay/${KERNEL_OVERLAYS}"
 
     cat > "${boot_dir}/extlinux/extlinux.conf" <<EOF
-# Deepin 25 Rockchip - Multi-Boot Configuration
-# Supports SD card, eMMC, and NVMe boot
+# Deepin 25 Rockchip 多介质启动配置
+# 生成时间: $(date)
+# 板卡: ${BOARD}
 #
-# RK3588 device numbering:
+# 启动设备对应关系:
 #   eMMC  -> /dev/mmcblk0p1
 #   SD    -> /dev/mmcblk1p1
 #   NVMe  -> /dev/nvme0n1p1
 #
-# cma=512M: Required by panthor GPU driver and RKMPP hardware video decoder.
+# cma=512M: Panthor GPU / RKMPP 硬解码所需
 
 default Deepin-SD
 menu title Deepin 25 Rockchip Boot Menu
@@ -579,7 +746,7 @@ label Deepin-SD
     initrd /boot/initrd.img-${kernel_version}
     fdt ${dtb_path}
     ${KERNEL_OVERLAYS:+fdtoverlays ${overlay_path}}
-    append root=/dev/mmcblk1p1 rootfstype=ext4 rootwait rw rootdelay=5 console=ttyS2,1500000 console=tty1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory loglevel=3 quiet splash cma=512M
+    append root=/dev/mmcblk1p1 rootfstype=ext4 rootwait rw rootdelay=5 console=ttyS2,1500000 console=tty1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory loglevel=3 quiet splash cma=512M drm.debug=0x1e
 
 label Deepin-eMMC
     menu label ^Deepin 25 (eMMC)
@@ -587,22 +754,22 @@ label Deepin-eMMC
     initrd /boot/initrd.img-${kernel_version}
     fdt ${dtb_path}
     ${KERNEL_OVERLAYS:+fdtoverlays ${overlay_path}}
-    append root=/dev/mmcblk0p1 rootfstype=ext4 rootwait rw rootdelay=5 console=ttyS2,1500000 console=tty1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory loglevel=3 quiet splash cma=512M
+    append root=/dev/mmcblk0p1 rootfstype=ext4 rootwait rw rootdelay=5 console=ttyS2,1500000 console=tty1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory loglevel=3 quiet splash cma=512M drm.debug=0x1e
 
 label Deepin-NVMe
-    menu label ^Deepin 25 (NVMe)
+    menu label ^Deepin 25 (NVMe SSD)
     linux /boot/vmlinuz-${kernel_version}
     initrd /boot/initrd.img-${kernel_version}
     fdt ${dtb_path}
     ${KERNEL_OVERLAYS:+fdtoverlays ${overlay_path}}
-    append root=/dev/nvme0n1p1 rootfstype=ext4 rootwait rw rootdelay=5 console=ttyS2,1500000 console=tty1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory loglevel=3 quiet splash cma=512M
+    append root=/dev/nvme0n1p1 rootfstype=ext4 rootwait rw rootdelay=5 console=ttyS2,1500000 console=tty1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory loglevel=3 quiet splash cma=512M drm.debug=0x1e
 
 label Deepin-Recovery
     menu label ^Deepin 25 Recovery (SD)
     linux /boot/vmlinuz-${kernel_version}
     initrd /boot/initrd.img-${kernel_version}
     fdt ${dtb_path}
-    append root=/dev/mmcblk1p1 rootfstype=ext4 rootwait rw console=ttyS2,1500000 console=tty1 single rescue cma=512M
+    append root=/dev/mmcblk1p1 rootfstype=ext4 rootwait rw console=ttyS2,1500000 console=tty1 single rescue cma=512M drm.debug=0x1e
 EOF
 
     log_info "extlinux.conf 生成完成 (内核版本: ${kernel_version})"
@@ -615,7 +782,7 @@ create_image() {
 
     local rootfs_size
     rootfs_size=$(du -sm "${rootfs_dir}" | cut -f1)
-    local img_size=$((rootfs_size + 512))
+    local img_size=$((rootfs_size + 1024))
 
     fallocate -l "${img_size}M" "${img_file}"
     parted --script "${img_file}" mklabel gpt mkpart primary ext4 16MiB 100%
@@ -637,7 +804,12 @@ create_image() {
     rsync -aHAX --info=progress2 "${rootfs_dir}/" "${mount_dir}/"
 
     # 确保 fstab UUID 与实际分区一致
-    sed -i "s|UUID=.* / .*ext4|UUID=${root_uuid} /              ext4|" "${mount_dir}/etc/fstab"
+    sed -i "s|UUID=.* / .*ext4|UUID=${root_uuid} / ext4|" "${mount_dir}/etc/fstab"
+
+    # 确保 fstab 包含正确的启动设备标识
+    if ! grep -q "^UUID=" "${mount_dir}/etc/fstab" 2>/dev/null; then
+        echo "UUID=${root_uuid} / ext4 defaults,noatime 0 1" >> "${mount_dir}/etc/fstab"
+    fi
 
     sync
     umount "${mount_dir}"
@@ -650,6 +822,14 @@ create_image() {
     losetup -d "${LOOP_DEV}"
     unset LOOP_DEV
 
+    # 压缩镜像（可选）
+    if [[ "${COMPRESS_IMG:-}" == "yes" ]]; then
+        log_info "压缩镜像..."
+        gzip -c "${img_file}" > "${img_file}.gz"
+        rm -f "${img_file}"
+        img_file="${img_file}.gz"
+    fi
+
     chown "${SUDO_USER:-root}:${SUDO_USER:-root}" "${img_file}" 2>/dev/null || true
 
     log_info "镜像创建完成: ${img_file}"
@@ -658,7 +838,7 @@ create_image() {
 
 main() {
     log_info "========================================"
-    log_info "Deepin 25 Rockchip 通用镜像构建系统"
+    log_info "Deepin 25 Rockchip 通用镜像构建系统 v2.0"
     log_info "目标板卡: ${BOARD}"
     log_info "========================================"
 
@@ -671,6 +851,7 @@ main() {
     build_rootfs
     install_overlays
     configure_rootfs
+    install_kernel
     generate_extlinux
     create_image
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=Orange Pi 5 Plus Fan Control
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fan-control.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

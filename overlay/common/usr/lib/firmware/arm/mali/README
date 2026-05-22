@@ -1,0 +1,10 @@
+# Mali G610 GPU Firmware
+
+Panthor 驱动需要 mali_csffw.bin 固件才能正确初始化。
+
+运行以下命令下载固件:
+    ./scripts/download-gpu-firmware.sh
+
+或手动下载:
+    curl -L https://github.com/armbian/build/raw/main/packages/blobs/rockchip/mali_csffw_g610.bin         -o overlay/common/usr/lib/firmware/arm/mali/mali_csffw_g610.bin
+    ln -s mali_csffw_g610.bin overlay/common/usr/lib/firmware/arm/mali/mali_csffw.bin

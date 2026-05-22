@@ -1,0 +1,8 @@
+# ROCK 5 ITX 音频设备命名
+# 覆盖通用规则，提供更精确的命名
+
+SUBSYSTEM=="sound", ENV{ID_PATH}=="platform-hdmi1-sound", ENV{SOUND_DESCRIPTION}="ROCK 5 ITX HDMI1 Audio"
+SUBSYSTEM=="sound", ENV{ID_PATH}=="platform-hdmiin-sound", ENV{SOUND_DESCRIPTION}="ROCK 5 ITX HDMI-In Audio"
+SUBSYSTEM=="sound", ENV{ID_PATH}=="platform-dp0-sound", ENV{SOUND_DESCRIPTION}="ROCK 5 ITX DP0 Audio"
+SUBSYSTEM=="sound", ENV{ID_PATH}=="platform-dp1-sound", ENV{SOUND_DESCRIPTION}="ROCK 5 ITX DP1 Audio"
+SUBSYSTEM=="sound", ENV{ID_PATH}=="platform-es8316-sound", ENV{SOUND_DESCRIPTION}="ROCK 5 ITX ES8316 Audio"
